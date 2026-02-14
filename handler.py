@@ -1228,10 +1228,95 @@ def handler(job):
 
 
 # ═══════════════════════════════════════════════════════════════
+# DESCARGA DE MODELOS AL PRIMER ARRANQUE
+# ═══════════════════════════════════════════════════════════════
+
+MODELS_MANIFEST = [
+    # SeedVR2 7B FP8 (Modo A — calidad principal)
+    {
+        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "size_gb": 7.5,
+    },
+    # SeedVR2 3B FP8 (Modo B — deflicker)
+    {
+        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        "size_gb": 3.5,
+    },
+    # SeedVR2 VAE
+    {
+        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_vae.safetensors",
+        "dest": "ComfyUI/models/SEEDVR2/seedvr2_vae.safetensors",
+        "size_gb": 0.3,
+    },
+    # Qwen GGUF Q4_K_M
+    {
+        "url": "https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF/resolve/main/Qwen-Image-Edit-Q4_K_M.gguf",
+        "dest": "ComfyUI/models/unet/Qwen-Image-Edit-Q4_K_M.gguf",
+        "size_gb": 4.5,
+    },
+    # Qwen Text Encoder FP8
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "dest": "ComfyUI/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "size_gb": 7.5,
+    },
+    # Qwen VAE
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors",
+        "dest": "ComfyUI/models/vae/qwen_image_vae.safetensors",
+        "size_gb": 0.2,
+    },
+]
+
+
+def ensure_models():
+    """Descarga modelos de HuggingFace si no existen. Flashboot cachea tras primer boot."""
+    total = len(MODELS_MANIFEST)
+    needed = []
+
+    for m in MODELS_MANIFEST:
+        full_path = WORKSPACE / m["dest"]
+        if not full_path.exists() or full_path.stat().st_size < 1024:
+            needed.append(m)
+
+    if not needed:
+        print(f"[MODELS] ✅ Todos los {total} modelos presentes")
+        return
+
+    total_gb = sum(m["size_gb"] for m in needed)
+    print(f"[MODELS] 📥 Descargando {len(needed)}/{total} modelos ({total_gb:.1f} GB)...")
+
+    for i, m in enumerate(needed, 1):
+        full_path = WORKSPACE / m["dest"]
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[MODELS] [{i}/{len(needed)}] {full_path.name} ({m['size_gb']}GB)...", flush=True)
+
+        try:
+            # wget es más fiable para archivos grandes que urllib
+            subprocess.run([
+                "wget", "-q", "--show-progress", "-O", str(full_path), m["url"]
+            ], check=True, timeout=1800)  # 30 min max por modelo
+            print(f"[MODELS]   ✅ {full_path.name} OK ({full_path.stat().st_size / 1e9:.1f}GB)")
+        except Exception as e:
+            print(f"[MODELS]   ❌ Error descargando {full_path.name}: {e}")
+            # Borrar archivo parcial
+            if full_path.exists():
+                full_path.unlink()
+            raise RuntimeError(f"Fallo descargando modelo: {full_path.name}") from e
+
+    print(f"[MODELS] 🎉 Todos los modelos descargados")
+
+
+# ═══════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Paso 1: Asegurar modelos (solo primera vez, flashboot cachea)
+    ensure_models()
+
     if runpod:
         print("[STARTUP] Iniciando RunPod Serverless Worker...")
         runpod.serverless.start({"handler": handler})
@@ -1248,3 +1333,4 @@ if __name__ == "__main__":
         }
         result = handler(test_job)
         print(json.dumps(result, indent=2, default=str))
+
