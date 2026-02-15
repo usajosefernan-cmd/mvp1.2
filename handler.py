@@ -768,9 +768,12 @@ def restore_single_frame_qwen(target_frame: Path, ref_texture: Path,
         ref_identity=str(ref_identity),
         output_path=str(output_path),
         seed=seed,
-        steps=40,            # Oficial HuggingFace (sin LoRA)
-        true_cfg=4.0,        # Oficial HuggingFace
-        guidance_scale=1.0   # Oficial HuggingFace
+        # Parámetros verificados por comunidad Reddit para restauración:
+        steps=35,            # 30-50 para restauración (NO 8 de Lightning)
+        cfg=4.0,             # 3.5-4.5 balance instrucción/natural
+        shift=12.0,          # >1024px requiere shift alto
+        strength=1.0,        # CFGNorm strength
+        denoise=0.5          # 0.4-0.6 retiene estructura + hallucina textura
     )
 
     # Enviar a ComfyUI y esperar resultado
@@ -867,56 +870,87 @@ def run_comfyui_prompt(workflow_api: dict, timeout: int = 600) -> dict:
 
 def build_qwen_workflow(target_frame: str, ref_texture: str,
                          ref_identity: str, output_path: str,
-                         seed: int = 42, steps: int = 40,
-                         true_cfg: float = 4.0,
-                         guidance_scale: float = 1.0) -> dict:
+                         seed: int = 42, steps: int = 35,
+                         cfg: float = 4.0,
+                         shift: float = 12.0,
+                         strength: float = 1.0,
+                         denoise: float = 0.5) -> dict:
     """
-    Construye workflow JSON (formato API) de ComfyUI para Qwen.
-    Nodos validados (archivo 04: prompting_qwen.md):
-    - LoadImage → frame degradado + refs
-    - TextEncodeQwenEditPlus → prompt + imágenes ref
-    - FluxKontextMultiReferenceLatentMethod → method: to_timestep
-    - KSampler → er_sde + bong_tangent
-    - VAEDecode + SaveImage
+    Construye workflow JSON (formato API) de ComfyUI para Qwen Image Edit.
+    Patrón: Híbrido — VL context (384px) + ReferenceLatent 4K nativo.
+
+    ENFOQUE HÍBRIDO (verificado contra nodes_qwen.py código fuente real):
+    1. 3 imágenes SÍ van a TextEncodeQwenImageEditPlus → VL model las ve
+       a 384x384 para entendimiento semántico ("Image 1", "Image 2", "Image 3")
+    2. VAE NO se conecta al TextEncode → NO genera reference_latents a 1MP
+    3. VAEEncode separado preserva resolución NATIVA (4K) de cada imagen
+    4. 3x ReferenceLatent chain inyecta todos los latents 4K en conditioning
+
+    Imágenes:
+    - Image 1 = Frame degradado (target a restaurar)
+    - Image 2 = Master cercano (textura HQ más similar)
+    - Image 3 = Master lejano (identidad/color global)
+
+    Pipeline:
+    ┌─ LoadImage(x3) ─┬→ TextEncode (VL 384x384, SIN vae) ──────┐
+    │                  └→ VAEEncode (nativo 4K) → RefLatent chain │
+    │  FluxKontextMultiRef (index_timestep_zero)                  │
+    │  → ReferenceLatent #1 (frame degradado = anclaje)           │
+    │  → ReferenceLatent #2 (master cercano = textura 4K)         │
+    │  → ReferenceLatent #3 (master lejano = identidad/color)     │
+    └─ KSampler (denoise=0.5) → VAEDecode → SaveImage ───────────┘
+
+    Nodos nativos verificados en comfy_extras/:
+    - TextEncodeQwenImageEditPlus → nodes_qwen.py (vae/images opcionales)
+    - FluxKontextMultiReferenceLatentMethod → nodes_flux.py
+    - ReferenceLatent → nodes_edit_model.py (conditioning + latent)
     """
     prompt_text = (
-        "The reference images show the same scene at high quality. "
-        "Restore this degraded frame to match the reference quality. "
-        "Preserve the EXACT pose, expression, and composition. "
-        "Transfer skin texture, hair detail, fabric weave, and color grading. "
-        "Photorealistic, sharp focus, natural tones."
+        "Apply the high-definition texture and details from Image 2 and Image 3 "
+        "to Image 1. Restore clarity and sharpness. Keep the pose, composition, "
+        "and facial structure of Image 1 exactly unchanged. Use Image 2 for "
+        "detailed texture and Image 3 for identity and color consistency. "
+        "High fidelity, photorealistic, 4k."
     )
 
     # ComfyUI API format: dict de nodos con class_type e inputs
+    # Ref: Reddit u/goddess_peeler PSA + u/Akmanic FluxKontext tutorial
     workflow_api = {
-        # Nodo 1: Cargar frame degradado
+        # ══════════════════════════════════════════════════════
+        # CARGAR IMÁGENES
+        # ══════════════════════════════════════════════════════
+        # Nodo 1: Frame degradado (target — Image 1 en prompt)
         "1": {
             "class_type": "LoadImage",
             "inputs": {"image": target_frame}
         },
-        # Nodo 2: Cargar ref textura (master cercano)
+        # Nodo 2: Ref textura HQ (master cercano — Image 2 en prompt)
         "2": {
             "class_type": "LoadImage",
             "inputs": {"image": ref_texture}
         },
-        # Nodo 3: Cargar ref identidad (master lejano)
+        # Nodo 3: Ref identidad (master lejano — Image 3 en prompt)
         "3": {
             "class_type": "LoadImage",
             "inputs": {"image": ref_identity}
         },
-        # Nodo 4: Cargar modelo GGUF
+
+        # ══════════════════════════════════════════════════════
+        # MODELO + VAE + CLIP
+        # ══════════════════════════════════════════════════════
+        # Nodo 4: Cargar modelo GGUF (Qwen Image Edit 2511)
         "4": {
             "class_type": "UnetLoaderGGUF",
             "inputs": {
                 "unet_name": "Qwen-Image-Edit-Q4_K_M.gguf"
             }
         },
-        # Nodo 5: Cargar VAE
+        # Nodo 5: VAE
         "5": {
             "class_type": "VAELoader",
             "inputs": {"vae_name": "qwen_image_vae.safetensors"}
         },
-        # Nodo 6: Cargar Text Encoder
+        # Nodo 6: CLIP Loader (GGUF dual)
         "6": {
             "class_type": "DualCLIPLoaderGGUF",
             "inputs": {
@@ -925,87 +959,171 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
                 "type": "qwen_image"
             }
         },
-        # Nodo 7: Encode prompt con TextEncodeQwenEditPlus
+
+        # ══════════════════════════════════════════════════════
+        # TEXT ENCODING — BYPASS: solo prompt + clip, SIN vae/images
+        # ══════════════════════════════════════════════════════
+        # ENFOQUE HÍBRIDO (verificado contra nodes_qwen.py):
+        # - Conectar image1/image2/image3 → VL model las ve a 384x384
+        #   (contexto semántico: entiende "Image 1", "Image 2", "Image 3")
+        # - NO conectar VAE → el nodo NO genera reference_latents (1MP)
+        # - Los reference_latents a resolución NATIVA se inyectan
+        #   por separado vía ReferenceLatent chain (nodos 11/12/13)
         "7": {
-            "class_type": "TextEncodeQwenEditPlus",
+            "class_type": "TextEncodeQwenImageEditPlus",
             "inputs": {
-                "text": prompt_text,
+                "prompt": prompt_text,
                 "clip": ["6", 0],
-                "image": ["1", 0],         # Frame degradado
-                "ref_image1": ["2", 0],    # Master textura
-                "ref_image2": ["3", 0],    # Master identidad
+                "image1": ["1", 0],  # Frame degradado → VL lo ve a 384x384
+                "image2": ["2", 0],  # Master cercano → VL lo ve a 384x384
+                "image3": ["3", 0]   # Master lejano → VL lo ve a 384x384
+                # NO vae → no genera reference_latents a 1MP
+                # Los latents 4K van por ReferenceLatent chain (nodos 11/12/13)
             }
         },
-        # Nodo 8: Negative prompt (espacio — oficial HuggingFace)
+
+        # ══════════════════════════════════════════════════════
+        # FLUX KONTEXT — obligatorio para 2511 (fix colores)
+        # ══════════════════════════════════════════════════════
+        # Reddit u/Akmanic: "index_timestep_zero" previene colores
+        # sobreexpuestos y hue shifts en 2511.
         "8": {
-            "class_type": "TextEncodeQwenEditPlus",
+            "class_type": "FluxKontextMultiReferenceLatentMethod",
             "inputs": {
-                "text": " ",
-                "clip": ["6", 0],
-                "image": ["1", 0],
+                "conditioning": ["7", 0],
+                "reference_latents_method": "index_timestep_zero"
             }
         },
-        # Nodo 9: VAE Encode del frame degradado → latent
+
+        # ══════════════════════════════════════════════════════
+        # VAEEncode — codificar cada imagen a resolución NATIVA
+        # ══════════════════════════════════════════════════════
+        # Esto preserva los detalles 4K que TextEncode destruiría.
+        # Nodo 9: VAEEncode del frame degradado
         "9": {
             "class_type": "VAEEncode",
             "inputs": {
-                "pixels": ["1", 0],
+                "pixels": ["1", 0],  # Frame degradado
                 "vae": ["5", 0]
             }
         },
-        # Nodo 10: Reference Latent (inject frame como referencia)
+        # Nodo 10: VAEEncode del master cercano (ref textura)
         "10": {
+            "class_type": "VAEEncode",
+            "inputs": {
+                "pixels": ["2", 0],  # Master cercano
+                "vae": ["5", 0]
+            }
+        },
+        # Nodo 10b: VAEEncode del master lejano (ref identidad)
+        "10b": {
+            "class_type": "VAEEncode",
+            "inputs": {
+                "pixels": ["3", 0],  # Master lejano
+                "vae": ["5", 0]
+            }
+        },
+
+        # ══════════════════════════════════════════════════════
+        # REFERENCE LATENT CHAIN — inyectar latents en conditioning
+        # ══════════════════════════════════════════════════════
+        # Reddit u/goddess_peeler: "Eliminate pixel drift with
+        # latent reference chaining"
+        #
+        # Nodo 11: ReferenceLatent #1 — Anclaje Estructural
+        # Inyecta el frame degradado como "esqueleto" del output
+        "11": {
             "class_type": "ReferenceLatent",
             "inputs": {
-                "latent": ["9", 0]
+                "conditioning": ["8", 0],   # Desde FluxKontext
+                "latent": ["9", 0]          # Frame degradado (estructura)
             }
         },
-        # Nodo 11: Multi Reference Method
-        "11": {
-            "class_type": "FluxKontextMultiReferenceLatentMethod",
-            "inputs": {
-                "method": "to_timestep",
-                "reference_latent": ["10", 0]
-            }
-        },
-        # Nodo 12: Empty Latent (target)
+        # Nodo 12: ReferenceLatent #2 — Inyector de Textura (master cercano)
+        # Inyecta el master cercano como fuente de detalle
         "12": {
-            "class_type": "EmptySD3LatentImage",
+            "class_type": "ReferenceLatent",
             "inputs": {
-                "width": 1024,
-                "height": 1024,
-                "batch_size": 1
+                "conditioning": ["11", 0],  # Desde RefLatent #1 (chain)
+                "latent": ["10", 0]         # Master cercano (textura 4K)
             }
         },
-        # Nodo 13: KSampler
+        # Nodo 12b: ReferenceLatent #3 — Identidad Global (master lejano)
+        # Inyecta el master lejano para consistencia de identidad/color
+        "12b": {
+            "class_type": "ReferenceLatent",
+            "inputs": {
+                "conditioning": ["12", 0],  # Desde RefLatent #2 (chain)
+                "latent": ["10b", 0]        # Master lejano (identidad)
+            }
+        },
+
+        # ══════════════════════════════════════════════════════
+        # NEGATIVE — vacío (ConditioningZeroOut)
+        # ══════════════════════════════════════════════════════
+        # NO usar negatives como "noise/blur" → causa piel plástica
         "13": {
-            "class_type": "KSampler",
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+                "conditioning": ["7", 0]  # ZeroOut del text encoding
+            }
+        },
+
+        # ══════════════════════════════════════════════════════
+        # MODEL PATCHES
+        # ══════════════════════════════════════════════════════
+        # Nodo 14: ModelSamplingAuraFlow → shift para alta resolución
+        "14": {
+            "class_type": "ModelSamplingAuraFlow",
             "inputs": {
                 "model": ["4", 0],
-                "positive": ["7", 0],
-                "negative": ["8", 0],
-                "latent_image": ["12", 0],
-                "seed": seed,
-                "steps": steps,
-                "cfg": guidance_scale,
-                "sampler_name": "er_sde",
-                "scheduler": "bong_tangent",
-                "denoise": 1.0
+                "shift": shift  # 12.0 para >1024px
             }
         },
-        # Nodo 14: VAE Decode
-        "14": {
+        # Nodo 15: CFGNorm → strength/guidance
+        "15": {
+            "class_type": "CFGNorm",
+            "inputs": {
+                "model": ["14", 0],
+                "strength": strength  # 1.0
+            }
+        },
+
+        # ══════════════════════════════════════════════════════
+        # KSAMPLER — restauración con denoise parcial
+        # ══════════════════════════════════════════════════════
+        # denoise=0.5: retiene estructura del frame degradado
+        # pero permite halucinar texturas de la referencia HQ
+        "16": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["15", 0],        # Modelo con AuraFlow+CFGNorm
+                "positive": ["12b", 0],    # Conditioning con RefLatent chain (3 refs)
+                "negative": ["13", 0],     # ZeroOut negative
+                "latent_image": ["9", 0],  # VAEEncode del frame degradado
+                "seed": seed,
+                "steps": steps,            # 35 (restauración requiere +steps)
+                "cfg": cfg,                # 4.0 (balance instrucción/natural)
+                "sampler_name": "er_sde",  # Preserva grano orgánico
+                "scheduler": "beta",       # Evita contrast burn
+                "denoise": denoise         # 0.5 (NO 1.0 para restauración)
+            }
+        },
+
+        # ══════════════════════════════════════════════════════
+        # DECODE + SAVE
+        # ══════════════════════════════════════════════════════
+        "17": {
             "class_type": "VAEDecode",
             "inputs": {
-                "samples": ["13", 0],
+                "samples": ["16", 0],
                 "vae": ["5", 0]
             }
         },
-        # Nodo 15: Save Image
-        "15": {
+        "18": {
             "class_type": "SaveImage",
             "inputs": {
-                "images": ["14", 0],
+                "images": ["17", 0],
                 "filename_prefix": Path(output_path).stem
             }
         }
