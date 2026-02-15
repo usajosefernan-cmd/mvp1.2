@@ -42,7 +42,10 @@ RUN cd /workspace/ComfyUI/custom_nodes && \
     git clone https://github.com/lrzjason/ComfyUI-QwenEditUtils.git && \
     # SeedVR2 Video Upscaler
     git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler && \
-    cd seedvr2_videoupscaler && pip install --no-cache-dir -r requirements.txt && cd ..
+    cd seedvr2_videoupscaler && pip install --no-cache-dir -r requirements.txt && cd .. && \
+    # WAS Node Suite (LoadImageBatch para SeedVR2 batch processing)
+    git clone https://github.com/WASasquatch/was-node-suite-comfyui.git && \
+    cd was-node-suite-comfyui && pip install --no-cache-dir -r requirements.txt && cd ..
 
 # ── Handler (modelos se descargan en ensure_models() al arrancar) ──
 COPY handler.py /workspace/handler.py
