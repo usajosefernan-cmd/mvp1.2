@@ -1205,6 +1205,23 @@ def concat_clips(clip_paths: List[Path], output_path: Path, audio_source: Path =
 
 
 # ═══════════════════════════════════════════════════════════════
+# UPLOAD RESULT VIDEO
+# ═══════════════════════════════════════════════════════════════
+
+def upload_result_video(video_path: str, job_id: str) -> str:
+    """Upload result video using RunPod rp_upload to S3/backblaze."""
+    try:
+        from runpod.serverless.utils.rp_upload import upload_file_to_bucket
+        url = upload_file_to_bucket(file_name=f"{job_id}/restored_final.mp4", file_location=video_path)
+        if url:
+            print(f"[UPLOAD] Video uploaded: {url}")
+            return url
+    except Exception as e:
+        print(f"[UPLOAD] rp_upload failed: {e}")
+    print("[UPLOAD] Returning local path as fallback")
+    return video_path
+
+# ═══════════════════════════════════════════════════════════════
 # HANDLER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
 
@@ -1315,7 +1332,7 @@ def handler(job):
 
         # ── Resultado (todo local en RunPod) ──
         result = {
-            "video_path": str(final_video),
+            "video_url": upload_result_video(str(final_video), job_id),
             "clips_detected": len(scenes),
             "frames_total": video_info["nb_frames"],
             "mode": mode,
