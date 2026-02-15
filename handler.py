@@ -1285,6 +1285,13 @@ def ensure_models():
         print(f"[MODELS] ✅ Todos los {total} modelos presentes")
         return
 
+    # HuggingFace token para descargas rápidas (evita rate limit)
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        print(f"[MODELS] 🔑 HF_TOKEN detectado — descargas autenticadas (sin rate limit)")
+    else:
+        print(f"[MODELS] ⚠️ Sin HF_TOKEN — descargas anónimas (puede ser lento)")
+
     total_gb = sum(m["size_gb"] for m in needed)
     print(f"[MODELS] 📥 Descargando {len(needed)}/{total} modelos ({total_gb:.1f} GB)...")
 
@@ -1294,10 +1301,12 @@ def ensure_models():
         print(f"[MODELS] [{i}/{len(needed)}] {full_path.name} ({m['size_gb']}GB)...", flush=True)
 
         try:
-            # wget es más fiable para archivos grandes que urllib
-            subprocess.run([
-                "wget", "-q", "--show-progress", "-O", str(full_path), m["url"]
-            ], check=True, timeout=1800)  # 30 min max por modelo
+            # wget con auth header si HF_TOKEN disponible
+            wget_cmd = ["wget", "-q", "--show-progress", "-O", str(full_path)]
+            if hf_token:
+                wget_cmd += ["--header", f"Authorization: Bearer {hf_token}"]
+            wget_cmd.append(m["url"])
+            subprocess.run(wget_cmd, check=True, timeout=1800)  # 30 min max por modelo
             print(f"[MODELS]   ✅ {full_path.name} OK ({full_path.stat().st_size / 1e9:.1f}GB)")
         except Exception as e:
             print(f"[MODELS]   ❌ Error descargando {full_path.name}: {e}")
