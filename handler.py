@@ -1448,7 +1448,7 @@ def ensure_models():
             # Borrar archivo parcial
             if full_path.exists():
                 full_path.unlink()
-            raise RuntimeError(f"Fallo descargando modelo: {full_path.name}") from e
+            print(f"[MODELS] Skipping {full_path.name} — will retry on next boot")
 
     print(f"[MODELS] 🎉 Todos los modelos descargados")
 
@@ -1459,7 +1459,10 @@ def ensure_models():
 
 if __name__ == "__main__":
     # Paso 1: Asegurar modelos (solo primera vez, flashboot cachea)
-    ensure_models()
+    try:
+        ensure_models()
+    except Exception as e:
+        print(f"[MODELS] Warning: {e} — starting worker anyway")
 
     if runpod:
         print("[STARTUP] Iniciando RunPod Serverless Worker...")
