@@ -38,6 +38,7 @@ COMFYUI_DIR = WORKSPACE / "ComfyUI"
 # ComfyUI API (para TODO: SeedVR2 + Qwen)
 COMFYUI_API_URL = os.environ.get("COMFYUI_API_URL", "http://127.0.0.1:8188")
 COMFYUI_PROCESS = None  # Referencia global al proceso de ComfyUI
+_initialized = False  # Lazy init: models + ComfyUI se cargan al primer job
 
 # ═══════════════════════════════════════════════════════════════
 # NanoBananaPro (gemini-3-pro-image-preview)
@@ -1281,11 +1282,34 @@ def upload_result_video(video_path: str, job_id: str) -> str:
 # HANDLER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
 
+def _lazy_init():
+    """Descarga modelos y arranca ComfyUI una sola vez (al primer job)."""
+    global _initialized
+    if _initialized:
+        return
+    print("[INIT] Primera ejecución — descargando modelos y arrancando ComfyUI...")
+    try:
+        ensure_models()
+    except Exception as e:
+        print(f"[MODELS] Warning: {e} — continuando sin todos los modelos")
+    try:
+        start_comfyui_server(timeout=600)
+        print("[INIT] ✅ ComfyUI listo")
+    except Exception as e:
+        print(f"[INIT] ⚠️ ComfyUI no arrancó: {e}")
+    _initialized = True
+    print("[INIT] ✅ Inicialización lazy completada")
+
+
 def handler(job):
     """
     RunPod Serverless Handler.
     Recibe un video, lo restaura, y devuelve la URL del resultado.
     """
+    # Lazy init: modelos + ComfyUI se cargan en el primer job,
+    # NO al arrancar el worker (evita cold start timeout de RunPod)
+    _lazy_init()
+
     job_input = job["input"]
     job_id = job.get("id", "local_test")
 
@@ -1514,27 +1538,22 @@ MODELS_MANIFEST = [
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Paso 1: Asegurar modelos (solo primera vez, flashboot cachea)
-    try:
-        ensure_models()
-    except Exception as e:
-        print(f"[MODELS] Warning: {e} — starting worker anyway")
-
-    # Paso 2: Pre-arrancar ComfyUI al startup del worker (no esperar al primer job)
-    # Esto elimina la latencia de cold-start de ComfyUI (~3-5 min con modelos pesados)
-    print("[STARTUP] Pre-arrancando ComfyUI...")
-    try:
-        start_comfyui_server(timeout=600)
-        print("[STARTUP] ✅ ComfyUI listo antes de aceptar jobs")
-    except Exception as e:
-        print(f"[STARTUP] ⚠️ ComfyUI no arrancó en pre-start: {e}")
-        print("[STARTUP] Se reintentará cuando llegue el primer job")
+    # ═══════════════════════════════════════════════════════════
+    # FIX COLD START: runpod.serverless.start() PRIMERO
+    # ═══════════════════════════════════════════════════════════
+    # ANTES: ensure_models() + start_comfyui_server() bloqueaban 10+ min
+    #        → RunPod mataba el worker por health check timeout (~2-8 min)
+    # AHORA: El worker arranca en <5s, modelos se descargan al primer job
+    # ═══════════════════════════════════════════════════════════
 
     if runpod:
-        print("[STARTUP] Iniciando RunPod Serverless Worker...")
+        print("[STARTUP] Iniciando RunPod Serverless Worker (lazy init)...")
+        print("[STARTUP] Modelos y ComfyUI se cargarán al recibir el primer job")
         runpod.serverless.start({"handler": handler})
     else:
-        # Test local
+        # Test local — aquí SÍ inicializamos todo antes
+        print("[TEST LOCAL] Inicializando para test local...")
+        _lazy_init()
         print("[TEST LOCAL] Ejecutando con video de prueba...")
         test_job = {
             "id": "test_001",
