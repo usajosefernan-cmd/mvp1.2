@@ -6,7 +6,7 @@
 # Flashboot cachea el estado → arranques subsiguientes son rápidos.
 # ═══════════════════════════════════════════════════════════════
 
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WORKSPACE_DIR=/workspace
@@ -34,11 +34,14 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI &
     pip install --no-cache-dir -r requirements.txt
 
 # ── Nodos custom ComfyUI ──
+# Nativos de ComfyUI (comfy_extras/): TextEncodeQwenImageEditPlus,
+# FluxKontextMultiReferenceLatentMethod, ModelSamplingAuraFlow, CFGNorm
+# Custom nodes necesarios:
 RUN cd /workspace/ComfyUI/custom_nodes && \
-    # GGUF para modelos cuantizados Qwen
+    # GGUF para modelos cuantizados (UnetLoaderGGUF, DualCLIPLoaderGGUF)
     git clone https://github.com/city96/ComfyUI-GGUF.git && \
     cd ComfyUI-GGUF && pip install --no-cache-dir -r requirements.txt && cd .. && \
-    # QwenEditUtils (TextEncodeQwenEditPlus, pad/crop)
+    # QwenEditUtils (TextEncodeQwenEditPlus_lrzjason — pad/crop utils)
     git clone https://github.com/lrzjason/ComfyUI-QwenEditUtils.git && \
     # SeedVR2 Video Upscaler
     git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler && \
