@@ -571,7 +571,7 @@ def generate_masters_for_clip(frames: List[Path], masters_dir: Path,
 # PASO 4A: RESTAURACIÓN — SeedVR2 DIRECTO (ComfyUI Workflow)
 # ═══════════════════════════════════════════════════════════════
 # Todo pasa por ComfyUI — más fácil añadir pasos futuros.
-# Nodos: SeedVR2DiTModelLoader + SeedVR2VAELoader + SeedVR2VideoUpscaler
+# Nodos: SeedVR2LoadDiTModel + SeedVR2LoadVAEModel + SeedVR2VideoUpscaler
 # ═══════════════════════════════════════════════════════════════
 
 def _ensure_valid_batch_size(batch_size: int) -> int:
@@ -591,8 +591,8 @@ def build_seedvr2_workflow(input_frames_dir: str, output_dir: str,
     """
     Construye workflow ComfyUI API JSON para SeedVR2VideoUpscaler.
     Nodos del custom node numz/ComfyUI-SeedVR2_VideoUpscaler:
-    - SeedVR2DiTModelLoader → carga modelo DiT (7B/3B)
-    - SeedVR2VAELoader → carga VAE
+    - SeedVR2LoadDiTModel → carga modelo DiT (7B/3B)
+    - SeedVR2LoadVAEModel → carga VAE
     - LoadImageBatch → carga directorio de frames
     - SeedVR2VideoUpscaler → procesa batch con consistencia temporal
     - SaveImage → guarda frames restaurados
@@ -603,9 +603,9 @@ def build_seedvr2_workflow(input_frames_dir: str, output_dir: str,
     workflow_api = {
         # Nodo 1: Cargar modelo DiT
         "1": {
-            "class_type": "SeedVR2DiTModelLoader",
+            "class_type": "SeedVR2LoadDiTModel",
             "inputs": {
-                "dit_model": model_file,
+                "model": model_file,
                 "device": "cuda:0",
                 "offload_device": "none",
                 "cache_model": True,
@@ -616,8 +616,9 @@ def build_seedvr2_workflow(input_frames_dir: str, output_dir: str,
         },
         # Nodo 2: Cargar VAE
         "2": {
-            "class_type": "SeedVR2VAELoader",
+            "class_type": "SeedVR2LoadVAEModel",
             "inputs": {
+                "model": "ema_vae_fp16.safetensors",
                 "device": "cuda:0",
                 "offload_device": "none"
             }
@@ -634,9 +635,9 @@ def build_seedvr2_workflow(input_frames_dir: str, output_dir: str,
         "4": {
             "class_type": "SeedVR2VideoUpscaler",
             "inputs": {
-                "dit_model": ["1", 0],
+                "dit": ["1", 0],
                 "vae": ["2", 0],
-                "images": ["3", 0],
+                "image": ["3", 0],
                 "resolution": 1080,
                 "max_resolution": 0,
                 "batch_size": batch_size,
@@ -786,8 +787,13 @@ def restore_single_frame_qwen(target_frame: Path, ref_texture: Path,
 # Todo pasa por ComfyUI — workflows para SeedVR2 y Qwen.
 # ═══════════════════════════════════════════════════════════════
 
-def start_comfyui_server():
-    """Arranca ComfyUI como daemon si no está corriendo."""
+def start_comfyui_server(timeout: int = 600):
+    """
+    Arranca ComfyUI como daemon si no está corriendo.
+    Timeout configurable (default 600s) para dar tiempo a cargar
+    modelos pesados (~33GB) en cold start.
+    Captura stdout/stderr para diagnóstico.
+    """
     global COMFYUI_PROCESS
 
     # Verificar si ya está corriendo
@@ -800,29 +806,78 @@ def start_comfyui_server():
     except Exception:
         pass
 
-    # Arrancar ComfyUI
-    print("[COMFYUI] Arrancando servidor...")
+    # Arrancar ComfyUI con logs visibles
+    print(f"[COMFYUI] Arrancando servidor (timeout={timeout}s)...")
+    comfyui_log = WORKSPACE / "comfyui_startup.log"
+    log_file = open(comfyui_log, "w")
+
     COMFYUI_PROCESS = subprocess.Popen(
         [sys.executable, "main.py", "--listen", "0.0.0.0", "--port", "8188",
          "--disable-auto-launch", "--disable-metadata"],
         cwd=str(COMFYUI_DIR),
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT
     )
 
-    # Esperar a que esté listo (max 120s)
-    for i in range(120):
+    # Esperar a que esté listo, mostrando progreso
+    start_t = time.time()
+    last_log_pos = 0
+
+    for i in range(timeout):
         time.sleep(1)
+
+        # Imprimir nuevas líneas del log de ComfyUI para diagnóstico
+        try:
+            with open(comfyui_log, "r") as lf:
+                lf.seek(last_log_pos)
+                new_lines = lf.read()
+                if new_lines.strip():
+                    for line in new_lines.strip().split("\n"):
+                        print(f"  [COMFYUI-LOG] {line}")
+                last_log_pos = lf.tell()
+        except Exception:
+            pass
+
+        # ¿El proceso murió?
+        if COMFYUI_PROCESS.poll() is not None:
+            rc = COMFYUI_PROCESS.returncode
+            # Leer últimas líneas del log
+            try:
+                with open(comfyui_log, "r") as lf:
+                    tail = lf.read()[-2000:]  # últimos 2KB
+            except Exception:
+                tail = "(no se pudo leer log)"
+            raise RuntimeError(
+                f"ComfyUI crasheó con código {rc} tras {i+1}s.\n"
+                f"Últimas líneas del log:\n{tail}"
+            )
+
+        # Verificar si respondió
         try:
             req = urllib.request.Request(f"{COMFYUI_API_URL}/system_stats")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status == 200:
-                    print(f"[COMFYUI] Listo (tardó {i+1}s)")
+                    elapsed = time.time() - start_t
+                    print(f"[COMFYUI] ✅ Listo (tardó {elapsed:.1f}s)")
                     return
         except Exception:
             pass
 
-    raise RuntimeError("ComfyUI no arrancó en 120s")
+        # Progreso cada 30s
+        if (i + 1) % 30 == 0:
+            print(f"[COMFYUI] Esperando... ({i+1}/{timeout}s)")
+
+    # Timeout — capturar log final
+    try:
+        with open(comfyui_log, "r") as lf:
+            tail = lf.read()[-3000:]  # últimos 3KB
+    except Exception:
+        tail = "(no se pudo leer log)"
+
+    raise RuntimeError(
+        f"ComfyUI no arrancó en {timeout}s.\n"
+        f"Últimas líneas del log:\n{tail}"
+    )
 
 
 def run_comfyui_prompt(workflow_api: dict, timeout: int = 600) -> dict:
@@ -942,7 +997,7 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
         "4": {
             "class_type": "UnetLoaderGGUF",
             "inputs": {
-                "unet_name": "Qwen-Image-Edit-Q4_K_M.gguf"
+                "unet_name": "Qwen_Image_Edit-Q4_K_M.gguf"
             }
         },
         # Nodo 5: VAE
@@ -970,7 +1025,7 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
         # - Los reference_latents a resolución NATIVA se inyectan
         #   por separado vía ReferenceLatent chain (nodos 11/12/13)
         "7": {
-            "class_type": "TextEncodeQwenImageEditPlus",
+            "class_type": "TextEncodeQwenImageEditPlus_lrzjason",
             "inputs": {
                 "prompt": prompt_text,
                 "clip": ["6", 0],
@@ -1221,6 +1276,7 @@ def upload_result_video(video_path: str, job_id: str) -> str:
     print("[UPLOAD] Returning local path as fallback")
     return video_path
 
+
 # ═══════════════════════════════════════════════════════════════
 # HANDLER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
@@ -1362,49 +1418,6 @@ def handler(job):
                 shutil.rmtree(d, ignore_errors=True)
 
 
-# ═══════════════════════════════════════════════════════════════
-# DESCARGA DE MODELOS AL PRIMER ARRANQUE
-# ═══════════════════════════════════════════════════════════════
-
-MODELS_MANIFEST = [
-    # SeedVR2 7B FP8 (Modo A — calidad principal)
-    {
-        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-        "size_gb": 7.5,
-    },
-    # SeedVR2 3B FP8 (Modo B — deflicker)
-    {
-        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-        "size_gb": 3.5,
-    },
-    # SeedVR2 VAE
-    {
-        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_vae.safetensors",
-        "dest": "ComfyUI/models/SEEDVR2/seedvr2_vae.safetensors",
-        "size_gb": 0.3,
-    },
-    # Qwen GGUF Q4_K_M
-    {
-        "url": "https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF/resolve/main/Qwen-Image-Edit-Q4_K_M.gguf",
-        "dest": "ComfyUI/models/unet/Qwen-Image-Edit-Q4_K_M.gguf",
-        "size_gb": 4.5,
-    },
-    # Qwen Text Encoder FP8
-    {
-        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
-        "dest": "ComfyUI/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
-        "size_gb": 7.5,
-    },
-    # Qwen VAE
-    {
-        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors",
-        "dest": "ComfyUI/models/vae/qwen_image_vae.safetensors",
-        "size_gb": 0.2,
-    },
-]
-
 
 def ensure_models():
     """Descarga modelos de HuggingFace si no existen. Flashboot cachea tras primer boot."""
@@ -1448,9 +1461,52 @@ def ensure_models():
             # Borrar archivo parcial
             if full_path.exists():
                 full_path.unlink()
-            print(f"[MODELS] Skipping {full_path.name} — will retry on next boot")
+            print(f"[MODELS]   Skipping {full_path.name} — will retry on next boot")
 
     print(f"[MODELS] 🎉 Todos los modelos descargados")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MODELOS — Manifest para ensure_models()
+# ═══════════════════════════════════════════════════════════════
+MODELS_MANIFEST = [
+    # SeedVR2 DiT 7B FP8 (Modo A: calidad máxima)
+    {
+        "url": "https://huggingface.co/AInVFX/SeedVR2_comfyUI/resolve/main/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "dest": "ComfyUI/models/diffusion_models/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "size_gb": 7.5,
+    },
+    # SeedVR2 DiT 3B FP8 (Modo B: deflicker rápido)
+    {
+        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        "dest": "ComfyUI/models/diffusion_models/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        "size_gb": 3.5,
+    },
+    # SeedVR2 VAE (compartida ambos modos)
+    {
+        "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors",
+        "dest": "ComfyUI/models/vae/ema_vae_fp16.safetensors",
+        "size_gb": 0.3,
+    },
+    # Qwen Image Edit GGUF Q4_K_M (Modo B: edición semántica)
+    {
+        "url": "https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF/resolve/main/Qwen_Image_Edit-Q4_K_M.gguf",
+        "dest": "ComfyUI/models/diffusion_models/Qwen_Image_Edit-Q4_K_M.gguf",
+        "size_gb": 12.2,
+    },
+    # Qwen Text Encoder / CLIP (FP8 scaled)
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "dest": "ComfyUI/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "size_gb": 7.5,
+    },
+    # Qwen VAE
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors",
+        "dest": "ComfyUI/models/vae/qwen_image_vae.safetensors",
+        "size_gb": 0.2,
+    },
+]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1463,6 +1519,16 @@ if __name__ == "__main__":
         ensure_models()
     except Exception as e:
         print(f"[MODELS] Warning: {e} — starting worker anyway")
+
+    # Paso 2: Pre-arrancar ComfyUI al startup del worker (no esperar al primer job)
+    # Esto elimina la latencia de cold-start de ComfyUI (~3-5 min con modelos pesados)
+    print("[STARTUP] Pre-arrancando ComfyUI...")
+    try:
+        start_comfyui_server(timeout=600)
+        print("[STARTUP] ✅ ComfyUI listo antes de aceptar jobs")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ ComfyUI no arrancó en pre-start: {e}")
+        print("[STARTUP] Se reintentará cuando llegue el primer job")
 
     if runpod:
         print("[STARTUP] Iniciando RunPod Serverless Worker...")
