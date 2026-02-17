@@ -38,7 +38,6 @@ COMFYUI_DIR = WORKSPACE / "ComfyUI"
 # ComfyUI API (para TODO: SeedVR2 + Qwen)
 COMFYUI_API_URL = os.environ.get("COMFYUI_API_URL", "http://127.0.0.1:8188")
 COMFYUI_PROCESS = None  # Referencia global al proceso de ComfyUI
-_initialized = False  # Lazy init: models + ComfyUI se cargan al primer job
 
 # ═══════════════════════════════════════════════════════════════
 # NanoBananaPro (gemini-3-pro-image-preview)
@@ -625,11 +624,17 @@ def build_seedvr2_workflow(input_frames_dir: str, output_dir: str,
             }
         },
         # Nodo 3: Cargar batch de frames (directorio)
+        # Bug 6 fix: LoadImageBatch (WAS) requiere mode, index, label, etc.
         "3": {
             "class_type": "LoadImageBatch",
             "inputs": {
+                "mode": "incremental_image",
                 "path": input_frames_dir,
-                "pattern": "*.png"
+                "pattern": "*.png",
+                "index": 0,
+                "label": "SeedVR2 Input Frames",
+                "allow_RGBA_output": False,
+                "filename_text_extension": True
             }
         },
         # Nodo 4: SeedVR2 Video Upscaler
@@ -688,7 +693,25 @@ def restore_seedvr2_direct(frames: List[Path], output_dir: Path,
     )
     run_comfyui_prompt(workflow, timeout=1200)  # SeedVR2 7B puede tardar
 
-    restored = sorted(output_dir.glob("*.png"))
+    # Bug 2 fix: SaveImage guarda en ComfyUI/output/, moverlos al output_dir
+    comfyui_output = COMFYUI_DIR / "output"
+    prefix = Path(output_dir).name  # El prefix usado en SaveImage
+    saved_files = sorted(comfyui_output.glob(f"{prefix}_*.png"))
+    if not saved_files:
+        # Fallback: buscar cualquier PNG reciente en output/
+        saved_files = sorted(comfyui_output.glob("*.png"))
+    for f in saved_files:
+        shutil.move(str(f), str(output_dir / f.name))
+    print(f"[SEEDVR2] Movidos {len(saved_files)} frames desde ComfyUI/output/")
+
+    # Bug 3 fix: Renombrar al patrón frame_%04d.png que ffmpeg espera
+    moved_files = sorted(output_dir.glob("*.png"))
+    for idx, f in enumerate(moved_files, 1):
+        new_name = output_dir / f"frame_{idx:04d}.png"
+        if f != new_name:
+            f.rename(new_name)
+
+    restored = sorted(output_dir.glob("frame_*.png"))
     print(f"[SEEDVR2] {len(restored)} frames restaurados")
     return restored
 
@@ -780,6 +803,21 @@ def restore_single_frame_qwen(target_frame: Path, ref_texture: Path,
 
     # Enviar a ComfyUI y esperar resultado
     run_comfyui_prompt(workflow_api, timeout=300)
+
+    # Bug 2 fix: SaveImage guarda en ComfyUI/output/, mover al path deseado
+    comfyui_output = COMFYUI_DIR / "output"
+    stem = Path(output_path).stem
+    saved_files = sorted(comfyui_output.glob(f"{stem}_*.png"))
+    if saved_files:
+        # Mover el primer archivo al path de destino
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(saved_files[0]), str(output_path))
+        # Limpiar extras si los hay
+        for f in saved_files[1:]:
+            f.unlink()
+        print(f"[QWEN] Frame guardado: {output_path.name}")
+    else:
+        print(f"[QWEN] ⚠️ No se encontró output para {stem} en ComfyUI/output/")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1006,12 +1044,13 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
             "class_type": "VAELoader",
             "inputs": {"vae_name": "qwen_image_vae.safetensors"}
         },
-        # Nodo 6: CLIP Loader (GGUF dual)
+        # Nodo 6: CLIP Loader (nativo — Qwen Image usa un solo text encoder)
+        # Bug 5 fix: DualCLIPLoaderGGUF cargaba el mismo archivo 2 veces (~15GB VRAM)
+        # CLIPLoader nativo con type="qwen_image" carga solo 1 vez (~7.5GB)
         "6": {
-            "class_type": "DualCLIPLoaderGGUF",
+            "class_type": "CLIPLoader",
             "inputs": {
-                "clip_name1": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
-                "clip_name2": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
                 "type": "qwen_image"
             }
         },
@@ -1071,8 +1110,9 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
                 "vae": ["5", 0]
             }
         },
-        # Nodo 10b: VAEEncode del master lejano (ref identidad)
-        "10b": {
+        # Nodo 20: VAEEncode del master lejano (ref identidad)
+        # Bug 1 fix: ID "10b" era ilegal para ComfyUI API → renumerado a "20"
+        "20": {
             "class_type": "VAEEncode",
             "inputs": {
                 "pixels": ["3", 0],  # Master lejano
@@ -1104,13 +1144,13 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
                 "latent": ["10", 0]         # Master cercano (textura 4K)
             }
         },
-        # Nodo 12b: ReferenceLatent #3 — Identidad Global (master lejano)
-        # Inyecta el master lejano para consistencia de identidad/color
-        "12b": {
+        # Nodo 21: ReferenceLatent #3 — Identidad Global (master lejano)
+        # Bug 1 fix: ID "12b" → "21", referencia "10b" → "20"
+        "21": {
             "class_type": "ReferenceLatent",
             "inputs": {
                 "conditioning": ["12", 0],  # Desde RefLatent #2 (chain)
-                "latent": ["10b", 0]        # Master lejano (identidad)
+                "latent": ["20", 0]         # Master lejano (identidad)
             }
         },
 
@@ -1154,7 +1194,7 @@ def build_qwen_workflow(target_frame: str, ref_texture: str,
             "class_type": "KSampler",
             "inputs": {
                 "model": ["15", 0],        # Modelo con AuraFlow+CFGNorm
-                "positive": ["12b", 0],    # Conditioning con RefLatent chain (3 refs)
+                "positive": ["21", 0],     # Conditioning con RefLatent chain (3 refs)
                 "negative": ["13", 0],     # ZeroOut negative
                 "latent_image": ["9", 0],  # VAEEncode del frame degradado
                 "seed": seed,
@@ -1282,34 +1322,11 @@ def upload_result_video(video_path: str, job_id: str) -> str:
 # HANDLER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
 
-def _lazy_init():
-    """Descarga modelos y arranca ComfyUI una sola vez (al primer job)."""
-    global _initialized
-    if _initialized:
-        return
-    print("[INIT] Primera ejecución — descargando modelos y arrancando ComfyUI...")
-    try:
-        ensure_models()
-    except Exception as e:
-        print(f"[MODELS] Warning: {e} — continuando sin todos los modelos")
-    try:
-        start_comfyui_server(timeout=600)
-        print("[INIT] ✅ ComfyUI listo")
-    except Exception as e:
-        print(f"[INIT] ⚠️ ComfyUI no arrancó: {e}")
-    _initialized = True
-    print("[INIT] ✅ Inicialización lazy completada")
-
-
 def handler(job):
     """
     RunPod Serverless Handler.
     Recibe un video, lo restaura, y devuelve la URL del resultado.
     """
-    # Lazy init: modelos + ComfyUI se cargan en el primer job,
-    # NO al arrancar el worker (evita cold start timeout de RunPod)
-    _lazy_init()
-
     job_input = job["input"]
     job_id = job.get("id", "local_test")
 
@@ -1497,13 +1514,13 @@ MODELS_MANIFEST = [
     # SeedVR2 DiT 7B FP8 (Modo A: calidad máxima)
     {
         "url": "https://huggingface.co/AInVFX/SeedVR2_comfyUI/resolve/main/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-        "dest": "ComfyUI/models/diffusion_models/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
         "size_gb": 7.5,
     },
     # SeedVR2 DiT 3B FP8 (Modo B: deflicker rápido)
     {
         "url": "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-        "dest": "ComfyUI/models/diffusion_models/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        "dest": "ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors",
         "size_gb": 3.5,
     },
     # SeedVR2 VAE (compartida ambos modos)
@@ -1538,22 +1555,27 @@ MODELS_MANIFEST = [
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # ═══════════════════════════════════════════════════════════
-    # FIX COLD START: runpod.serverless.start() PRIMERO
-    # ═══════════════════════════════════════════════════════════
-    # ANTES: ensure_models() + start_comfyui_server() bloqueaban 10+ min
-    #        → RunPod mataba el worker por health check timeout (~2-8 min)
-    # AHORA: El worker arranca en <5s, modelos se descargan al primer job
-    # ═══════════════════════════════════════════════════════════
+    # Paso 1: Asegurar modelos (solo primera vez, flashboot cachea)
+    try:
+        ensure_models()
+    except Exception as e:
+        print(f"[MODELS] Warning: {e} — starting worker anyway")
+
+    # Paso 2: Pre-arrancar ComfyUI al startup del worker (no esperar al primer job)
+    # Esto elimina la latencia de cold-start de ComfyUI (~3-5 min con modelos pesados)
+    print("[STARTUP] Pre-arrancando ComfyUI...")
+    try:
+        start_comfyui_server(timeout=600)
+        print("[STARTUP] ✅ ComfyUI listo antes de aceptar jobs")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ ComfyUI no arrancó en pre-start: {e}")
+        print("[STARTUP] Se reintentará cuando llegue el primer job")
 
     if runpod:
-        print("[STARTUP] Iniciando RunPod Serverless Worker (lazy init)...")
-        print("[STARTUP] Modelos y ComfyUI se cargarán al recibir el primer job")
+        print("[STARTUP] Iniciando RunPod Serverless Worker...")
         runpod.serverless.start({"handler": handler})
     else:
-        # Test local — aquí SÍ inicializamos todo antes
-        print("[TEST LOCAL] Inicializando para test local...")
-        _lazy_init()
+        # Test local
         print("[TEST LOCAL] Ejecutando con video de prueba...")
         test_job = {
             "id": "test_001",
