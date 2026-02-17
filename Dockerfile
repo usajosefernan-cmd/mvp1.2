@@ -34,21 +34,21 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI &
     pip install --no-cache-dir -r requirements.txt
 
 # ── Nodos custom ComfyUI ──
-# Nativos de ComfyUI (comfy_extras/): TextEncodeQwenImageEditPlus,
-# FluxKontextMultiReferenceLatentMethod, ModelSamplingAuraFlow, CFGNorm
-# Custom nodes necesarios:
+# NATIVOS de ComfyUI (comfy_extras/): ReferenceLatent, FluxKontextMultiReferenceLatentMethod,
+# ModelSamplingAuraFlow, CFGNorm, TextEncodeQwenImageEditPlus.
+# CUSTOM: GGUF loaders, SeedVR2, WAS Node Suite (LoadImageBatch), QwenEditUtils.
 RUN cd /workspace/ComfyUI/custom_nodes && \
-    # GGUF para modelos cuantizados (UnetLoaderGGUF, DualCLIPLoaderGGUF)
+    # GGUF para modelos cuantizados (UnetLoaderGGUF)
     git clone https://github.com/city96/ComfyUI-GGUF.git && \
     cd ComfyUI-GGUF && pip install --no-cache-dir -r requirements.txt && cd .. && \
-    # QwenEditUtils (TextEncodeQwenEditPlus_lrzjason — pad/crop utils)
-    git clone https://github.com/lrzjason/ComfyUI-QwenEditUtils.git && \
     # SeedVR2 Video Upscaler
     git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler && \
     cd seedvr2_videoupscaler && pip install --no-cache-dir -r requirements.txt && cd .. && \
-    # WAS Node Suite (LoadImageBatch para SeedVR2 batch processing)
+    # WAS Node Suite (LoadImageBatch — carga batch de frames desde directorio)
     git clone https://github.com/WASasquatch/was-node-suite-comfyui.git && \
-    cd was-node-suite-comfyui && pip install --no-cache-dir -r requirements.txt && cd ..
+    cd was-node-suite-comfyui && pip install --no-cache-dir -r requirements.txt && cd .. && \
+    # QwenEditUtils (TextEncodeQwenImageEditPlus_lrzjason — encoding con refs)
+    git clone https://github.com/lrzjason/Comfyui-QwenEditUtils.git
 
 # ── Handler (modelos se descargan en ensure_models() al arrancar) ──
 COPY handler.py /workspace/handler.py
